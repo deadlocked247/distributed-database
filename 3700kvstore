@@ -1,0 +1,352 @@
+#!/usr/bin/python -u
+
+import sys
+import socket
+import time
+import json
+import random
+import select
+import util
+
+HEARTBEAT_TIMEOUT = 120
+
+LEADER = "LEADER"
+FOLLOWER = "FOLLOWER"
+CANDIDATE = "CANDIDATE"
+
+# Message types
+
+REQUEST_VOTE = 'request_vote'
+ADD_ENTRIES = 'add_entries'
+ADD_ENTRIES_ACK = 'add_entries_rpc_ack'
+
+
+class KVStore:
+    def __init__(self, id, replicas):
+        self.id = id
+        self.replicas = replicas
+        self.current_election = 0
+        self.proposed_leader = None # who we voted for
+        self.quorum = 3 # initial size of quorum
+        self.leader = "FFFF" # current knowledge of leader
+        self.state = FOLLOWER
+        self.incoming_messages = [] # queue of all messages we want to address
+        self.votes = [] # votes this node has done
+
+        self.last_message = 0
+        self.matches = {} # map of all match indecies
+
+        for replica in self.replicas:
+            self.matches[replica] = self.last_message
+
+        self.log = []
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.sock.connect(id)
+        self.storage = {}
+        self.election_TO = random.randint(150, 300)
+        self.election_initial_TO = util.now()
+        self.heartbeat_initial_TO = util.now()
+
+    def run(self):
+        while True:
+            previous_state = self.state
+            if self.state in [FOLLOWER, CANDIDATE] and self.election_timedout():
+                # Initiate a new election
+                self.state = CANDIDATE
+                self.current_election += 1
+                self.proposed_leader = self.id
+                self.votes = [self.proposed_leader]
+                self.get_new_election_timeout()
+                # Send vote out to everyone - b
+                self.send({"src": self.id,
+                                    "dst": "FFFF",
+                                    "leader": "FFFF",
+                                    "type": REQUEST_VOTE,
+                                    "term": self.current_election,
+                                    "log_index": len(self.log) - 1,
+                                    "log_term": self.last_term()})
+
+            if self.state == LEADER:
+                if self.last_message == len(self.log):
+                    for entry in self.incoming_messages:
+                        self.receive_client_message(entry)
+                    self.incoming_messages = []
+
+                    if self.last_message < len(self.log):
+                        self.outgoing_entries()
+
+                if self.heart_beat_timedout():
+                    self.outgoing_entries()
+
+            ready = select.select([self.sock], [], [], 0.01)[0]
+
+            if self.sock in ready:
+                msg_raw = self.sock.recv(32768)
+                # Load json message and make sure that it has data
+                if len(msg_raw) != 0:
+                    msg = json.loads(msg_raw)
+                    # IF the message is a request vote
+                    if msg['type'] in [REQUEST_VOTE, ADD_ENTRIES] and msg['term'] > self.current_election:
+                        self.current_election = msg['term']
+                        if msg['type'] == ADD_ENTRIES:
+                            if self.state == LEADER and len(self.log) <= msg['log_size']:
+                                self.become_follower(msg['src'], msg['term'])
+                        else:
+                            if not self.state == FOLLOWER:
+                                self.become_follower(msg['src'], msg['term'])
+                            elif self.state == FOLLOWER:
+                                self.become_follower(msg['src'], msg['term'])
+
+                    json_type = msg['type']
+                    if self.state == LEADER:
+                        if json_type == ADD_ENTRIES_ACK:
+                            self.receive_append_entries_ack(msg)
+
+                        if json_type in ['get', 'put']:
+                            self.incoming_messages.append(msg)
+
+                    if self.state == CANDIDATE:
+                        if json_type in ['get', 'put']:
+                            self.incoming_messages.append(msg)
+                        if json_type == 'vote':
+                            # Process new vote messag, determine if we can add to our counted votes
+                            if msg['term'] == self.current_election and msg['src'] not in self.votes:
+                                self.votes.append(msg['src'])
+
+                            if len(self.votes) >= self.quorum:
+                                self.new_leader()
+
+                    if self.state == FOLLOWER:
+                        if json_type == REQUEST_VOTE:
+                            # Determine if this deplica should vote for candidate using message
+                            if msg['term'] >= self.current_election:
+                                if self.proposed_leader is None or self.proposed_leader == msg['src']:
+                                    if self.last_term() <= msg['log_term']:
+                                        if len(self.log) - 1 <= msg['log_index']:
+                                            vote = {"src": self.id,
+                                                    "dst": msg['src'],
+                                                    "leader": "FFFF",
+                                                    "type": "vote",
+                                                    "term": self.current_election}
+                                            self.proposed_leader = msg['src']
+                                            self.send(vote)
+                                            self.get_new_election_timeout()
+
+                        if json_type == ADD_ENTRIES:
+                            self.receive_append_entries(msg)
+
+                        if json_type in ['get', 'put']:
+                            self.redirect_client(msg)
+
+    #Send on socket to other machines
+    def send(self, message):
+        try:
+            self.sock.send(json.dumps(message) + '\n')
+        except:
+            raise Exception("Could not successfully send message" + str(json_message))
+
+
+    # Go through all replicas and send necessary entries to keep followers updated with current leader
+    def outgoing_entries(self):
+        for replica in self.matches:
+            # Create new replica, send message to the id
+            previous_term = 0
+            if len(self.log) and self.matches[replica] > 0:
+                previous_term = self.log[self.matches[replica] - 1][1]
+            entries = self.log[self.matches[replica]: self.matches[replica] + 50]
+            append_entries_rpc = {"src": self.id,
+                                "dst": replica,
+                                "leader": self.id,
+                                "type": ADD_ENTRIES,
+                                "term": self.current_election,
+                                "previous_log": max(0, self.matches[replica] - 1),
+                                "previous_term": previous_term,
+                                "entries": entries,
+                                "last_leader": self.last_message,
+                                "log_size": len(self.log)}
+            self.send(append_entries_rpc)
+
+        self.heartbeat_initial_TO = util.now()
+
+    # send redirect message to client using json
+    def redirect_client(self, json):
+        self.send({"src": self.id,
+                            "dst": json['src'],
+                            "leader": self.leader,
+                            "type": "redirect",
+                            "MID": json['MID']})
+
+    # Receiving a client message, get or put
+    def receive_client_message(self, msg):
+        if msg['type'] == 'put':
+            self.log.append(((msg['type'], (msg['key'], msg['value'])), self.current_election, msg['src'], msg['MID']))
+        elif msg['type'] == 'get':
+            self.log.append(((msg['type'], (msg['key'])), self.current_election, msg['src'], msg['MID']))
+
+
+    # Get an entry from other replica
+    def receive_append_entries(self, json):
+        if json['term'] >= self.current_election:
+            self.get_new_election_timeout()
+            self.leader = json['src']
+            #See if there are any entries to put in initially
+            if not len(self.log):
+                self.log = json['entries']
+                if len(self.log):
+                    self.follower_command_handler(json['last_leader'])
+                    self.ack_append_entries(json['log_size'])
+
+            elif len(self.log) - 1 >= json['previous_log']:
+
+                if self.log[json['previous_log']][1] == json['previous_term']:
+
+                    self.log = self.log[:json['previous_log'] + 1] + json['entries']
+
+                    if len(json['entries']):
+                        self.follower_command_handler(json['last_leader'])
+                        self.ack_append_entries(json['log_size'])
+
+                elif self.log[json['previous_log']][1] != json['previous_term']:
+                    self.log = self.log[:json['previous_log']] + json['entries']
+                    self.ack_append_entries(json['log_size'])
+
+            else:
+                self.ack_append_entries(json['log_size'])
+
+#ACK the leader with new information
+    def ack_append_entries(self, leader_log):
+	match_index = min(len(self.log), leader_log)
+        append_entries_rpc = {"src": self.id,
+                              "dst": self.leader,
+                              "leader": self.leader,
+                              "type": ADD_ENTRIES_ACK,
+                              "term": self.current_election,
+                              "match_index": match_index}
+
+        self.send(append_entries_rpc)
+
+#Handle an append ACK, check for quorum and update index
+    def receive_append_entries_ack(self, json_msg):
+        if json_msg['term'] != self.current_election:
+            return
+        self.matches[json_msg['src']] = json_msg['match_index']
+        q_number = 1
+        for replica in self.matches:
+            if self.matches[replica] == len(self.log):
+                q_number = q_number + 1
+        if q_number == self.quorum:
+            self.leader_command_handler()
+            self.last_message = len(self.log)
+            if len(self.incoming_messages) > 0:
+                for entry in self.incoming_messages:
+                    self.receive_client_message(entry)
+                self.incoming_messages = []
+                self.outgoing_entries()
+
+#Transactionally applies each command
+    def leader_command_handler(self):
+        min_message = self.last_message
+        max_message = len(self.log)
+        for i in range(min_message, max_message):
+            entry = self.log[i]
+            client_addr = entry[2]
+            mess_id = entry[3]
+            command = entry[0][0]
+            content = entry[0][1]
+            #Handle each type of command
+            if command == 'get':
+                k = content
+                v = self.storage.get(k)
+                if v:
+                    resp = {'src': self.id, 'dst': client_addr, 'leader': self.id,
+                                'type': 'ok', 'MID': mess_id, 'value': v}
+                else:
+                    resp = {"src": self.id, "dst": client_addr, "leader": self.id,
+                                "type": "fail", "MID": mess_id, "value": ""}
+            elif command == 'put':
+                k = content[0]
+                v = content[1]
+                resp = {'src': self.id, 'dst': client_addr, 'leader': self.id,
+                           'type': 'ok', 'MID': mess_id}
+                self.put_into_store(k, v)
+            self.send(resp)
+
+    #Handle a command, committing a put
+    def follower_command_handler(self, last_checked_in):
+        self_known_index = min(len(self.log), last_checked_in)
+        for index in range(self.last_message, self_known_index):
+            entry = self.log[index]
+            content = entry[0][1]
+
+            #Store the entry from the entry on puts
+            if entry[0][0] == 'put':
+                key = content[0]
+                val = content[1]
+                self.put_into_store(key, val)
+        self.last_message = min(len(self.log), last_checked_in)
+
+# Get the term of last log entry
+    def last_term(self):
+        last_log_term = 0
+        if len(self.log):
+            last_log_term = self.log[len(self.log) - 1][1]
+        return last_log_term
+
+#Move to a new leader, long live the new leader
+    def new_leader(self):
+        for replica in self.replicas:
+            self.matches[replica] = self.last_message
+        self.get_new_election_timeout()
+        self.state = LEADER
+        self.leader = self.id
+        #Rehandle the messages with the new leader
+        for entry in self.incoming_messages:
+            self.receive_client_message(entry)
+        self.incoming_messages = []
+        self.outgoing_entries()
+
+#Reset state to a new follower of the given leader
+    def become_follower(self, leader_id, term):
+        self.current_election = term
+        self.state = FOLLOWER
+        self.leader = leader_id
+	self.votes = []
+        self.get_new_election_timeout()
+        self.proposed_leader = None
+        self.send_redirects_from_client_queue()
+
+    def send_redirects_from_client_queue(self):
+        for message in self.incoming_messages:
+            self.redirect_client(message)
+        self.incoming_messages = []
+
+#handle put into memory storage
+    def put_into_store(self, key, val):
+        self.storage[key] = val
+
+#Reset election timeout
+    def get_new_election_timeout(self):
+        self.election_TO = random.randint(150, 300)
+        self.election_initial_TO = util.now()
+
+    def reset_heartbeat_timeout(self):
+        self.heartbeat_initial_TO = util.now()
+
+#Have we timed out election?
+    def election_timedout(self):
+        return (util.now() - self.election_initial_TO).microseconds > (self.election_TO * 1000)
+
+#Have we timed out the leader?
+    def heart_beat_timedout(self):
+        return (util.now() - self.heartbeat_initial_TO).microseconds > (HEARTBEAT_TIMEOUT * 1000)
+
+
+
+
+
+instance_id = sys.argv[1]
+instance = KVStore(instance_id, sys.argv[2:])
+time.sleep(0.15)
+instance.get_new_election_timeout()
+
+instance.run()

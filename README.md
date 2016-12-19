@@ -13,4 +13,6 @@ behavior, with care to make sure the source of each print statement was
 identifiable to deal with the possible confusion over multiple machines
 committing similar actions simultaneously.
 
+To run tests `./test`
+To run a specific configuration `./run simple-1.json`
 
